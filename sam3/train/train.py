@@ -54,7 +54,22 @@ def single_proc_run(local_rank, main_port, cfg, world_size):
         logging.info(e)
 
     trainer = instantiate(cfg.trainer, _recursive_=False)
-    trainer.run()
+    try:
+        trainer.run()
+    except KeyboardInterrupt:
+        logging.info(
+            f"[rank {local_rank}] KeyboardInterrupt received — shutting down cleanly. "
+            f"Rolling checkpoint.pt holds the last completed epoch."
+        )
+    finally:
+        # Tear down the NCCL process group so other ranks don't hang on collectives
+        # and file handles flush. Safe to call unconditionally.
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception as e:
+                logging.warning(f"[rank {local_rank}] destroy_process_group failed: {e}")
 
 
 def single_node_runner(cfg, main_port: int):
