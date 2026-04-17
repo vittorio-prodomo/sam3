@@ -1,0 +1,199 @@
+# @package _global_
+#
+# Benchmark config for category_chunk_size. Runs VAL-ONLY on a small subset
+# of val images. Sweep via CLI override:
+#   scratch.category_chunk_size=2
+#   scratch.category_chunk_size=4
+#   scratch.category_chunk_size=8
+# Measures VRAM peak and wall-clock time per chunk size.
+# Not for training. No checkpoints, no W&B, no TIDE.
+
+defaults:
+  - _self_
+
+paths:
+  dataset_root: /data/projects/bridge_defect_detection/datasets/spartans_sam3
+  experiment_log_dir: /tmp/sam3_benchmark_chunks
+  bpe_path: /data/projects/bridge_defect_detection/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+
+spartans_train:
+  num_val_images: 20  # small val subset for fast benchmarking
+
+  val_transforms:
+    - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+      transforms:
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
+        - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          max_size:
+            _target_: sam3.train.transforms.basic.get_random_resize_max_size
+            size: ${scratch.resolution}
+          square: true
+          consistent_transform: False
+        - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+        - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+          mean: ${scratch.train_norm_mean}
+          std: ${scratch.train_norm_std}
+
+scratch:
+  enable_segmentation: True
+  d_model: 256
+  category_chunk_size: 1  # set by bench_sam3_chunks.py
+
+  pos_embed:
+    _target_: sam3.model.position_encoding.PositionEmbeddingSine
+    num_pos_feats: ${scratch.d_model}
+    normalize: true
+    scale: null
+    temperature: 10000
+
+  use_presence_eval: True
+  original_box_postprocessor:
+    _target_: sam3.eval.postprocessors.PostProcessImage
+    max_dets_per_img: 100
+    iou_type: segm
+    use_original_ids: true
+    use_original_sizes_box: true
+    use_original_sizes_mask: false
+    eval_resolution: ${scratch.resolution}
+    mask_interpolation_chunk_size: 8
+    use_presence: ${scratch.use_presence_eval}
+
+  matcher:
+    _target_: sam3.train.matcher.BinaryHungarianMatcherV2
+    focal: true
+    cost_class: 2.0
+    cost_bbox: 5.0
+    cost_giou: 2.0
+    alpha: 0.25
+    gamma: 2
+    stable: False
+  scale_by_find_batch_size: True
+
+  resolution: 1008
+  consistent_transform: False
+  max_ann_per_img: 200
+
+  train_norm_mean: [0.5, 0.5, 0.5]
+  train_norm_std: [0.5, 0.5, 0.5]
+
+  num_val_workers: 0
+  hybrid_repeats: 1
+  context_length: 2
+  gather_pred_via_filesys: false
+
+  val_batch_size: 1
+  collate_fn_val:
+    _target_: sam3.train.data.collator.collate_fn_api
+    _partial_: true
+    repeats: ${scratch.hybrid_repeats}
+    dict_key: spartans
+    with_seg_masks: ${scratch.enable_segmentation}
+
+trainer:
+  _target_: sam3.train.trainer.Trainer
+  skip_saving_ckpts: true
+  empty_gpu_mem_cache_after_eval: True
+  skip_first_val: false
+  max_epochs: 1
+  accelerator: cuda
+  seed_value: 42
+  val_epoch_freq: 1
+  mode: val
+  gradient_accumulation_steps: 1
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: False
+    gradient_as_bucket_view: True
+    static_graph: True
+
+  loss:
+    default:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+
+  data:
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        limit_ids: ${spartans_train.num_val_images}
+        load_segmentation: ${scratch.enable_segmentation}
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
+          include_negatives: true
+          category_chunk_size: ${scratch.category_chunk_size}
+          _partial_: true
+        img_folder: ${paths.dataset_root}/test/data/
+        ann_file: ${paths.dataset_root}/test/_annotations.coco.json
+        transforms: ${spartans_train.val_transforms}
+        max_ann_per_img: 100000
+        multiplier: 1
+        training: false
+
+      shuffle: False
+      batch_size: ${scratch.val_batch_size}
+      num_workers: ${scratch.num_val_workers}
+      pin_memory: True
+      drop_last: False
+      collate_fn: ${scratch.collate_fn_val}
+
+  model:
+    _target_: sam3.model_builder.build_sam3_image_model
+    bpe_path: ${paths.bpe_path}
+    device: cpus
+    eval_mode: true
+    enable_segmentation: ${scratch.enable_segmentation}
+    run_nms: true
+    nms_prob_thresh: 0.001
+    nms_iou_thresh: 0.8
+    nms_use_iom: true
+
+  meters:
+    val:
+      spartans:
+        detection:
+          _target_: sam3.eval.coco_writer.PredictionDumper
+          iou_type: "segm"
+          dump_dir: ${launcher.experiment_log_dir}/dumps
+          merge_predictions: True
+          postprocessor: ${scratch.original_box_postprocessor}
+          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+          maxdets: 100
+          pred_file_evaluators:
+            - _target_: sam3.eval.coco_eval_offline.CocoEvaluatorOfflineWithPredFileEvaluators
+              gt_path: ${paths.dataset_root}/test/_annotations.coco.json
+              tide: false
+              iou_type: "segm"
+
+  optim:
+    amp:
+      enabled: True
+      amp_dtype: bfloat16
+
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 0
+
+  logging:
+    tensorboard_writer: null
+    wandb_writer: null
+    mlflow_writer: null
+    log_dir: ${launcher.experiment_log_dir}/logs
+    log_freq: 10
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1
+  experiment_log_dir: ${paths.experiment_log_dir}
+  multiprocessing_context: forkserver
+
+submitit:
+  account: null
+  partition: null
+  qos: null
+  timeout_hour: 1
+  use_cluster: False
+  cpus_per_task: 4
+  port_range: [10000, 65000]
+  constraint: null
