@@ -44,6 +44,8 @@ class PostProcessImage(nn.Module):
         always_interpolate_masks_on_gpu: bool = True,
         use_presence: bool = True,
         detection_threshold: float = -1.0,
+        mask_interpolation_chunk_size: int = 8,
+        eval_resolution: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.max_dets_per_img = max_dets_per_img
@@ -57,6 +59,8 @@ class PostProcessImage(nn.Module):
         self.use_original_ids = use_original_ids
         self.use_original_sizes_box = use_original_sizes_box
         self.use_original_sizes_mask = use_original_sizes_mask
+        self.mask_interpolation_chunk_size = mask_interpolation_chunk_size
+        self.eval_resolution = eval_resolution
 
     @torch.no_grad()
     def forward(
@@ -183,38 +187,77 @@ class PostProcessImage(nn.Module):
                 h, w = target_sizes[i]
                 if keep is not None:
                     mask = mask[keep[i]]
-                # Uses the gpu version fist, moves masks to cpu if it fails"""
-                try:
-                    interpolated = (
-                        interpolate(
-                            mask.unsqueeze(1),
-                            (h, w),
-                            mode="bilinear",
-                            align_corners=False,
-                        ).sigmoid()
-                        > 0.5
-                    )
-                except Exception as e:
-                    logging.info("Issue found, reverting to CPU mode!")
-                    mask_device = mask.device
-                    mask = mask.cpu()
-                    interpolated = (
-                        interpolate(
-                            mask.unsqueeze(1),
-                            (h, w),
-                            mode="bilinear",
-                            align_corners=False,
-                        ).sigmoid()
-                        > 0.5
-                    )
-                    interpolated = interpolated.to(mask_device)
+
+                if mask.numel() == 0:
+                    if self.convert_mask_to_rle:
+                        out_masks[i] = []
+                    else:
+                        out_masks[i] = mask.unsqueeze(1)
+                        if self.to_cpu:
+                            out_masks[i] = out_masks[i].cpu()
+                    continue
+
+                # Chunked interpolation: upscale N masks at a time to avoid
+                # GPU OOM when interpolating many queries to full resolution.
+                chunks = mask.split(self.mask_interpolation_chunk_size, dim=0)
 
                 if self.convert_mask_to_rle:
-                    out_masks[i] = robust_rle_encode(interpolated.squeeze(1))
+                    rle_list = []
+                    for chunk in chunks:
+                        try:
+                            interp = (
+                                interpolate(
+                                    chunk.unsqueeze(1),
+                                    (h, w),
+                                    mode="bilinear",
+                                    align_corners=False,
+                                ).sigmoid()
+                                > 0.5
+                            )
+                        except Exception:
+                            logging.info("Issue found, reverting to CPU mode!")
+                            interp = (
+                                interpolate(
+                                    chunk.cpu().unsqueeze(1),
+                                    (h, w),
+                                    mode="bilinear",
+                                    align_corners=False,
+                                ).sigmoid()
+                                > 0.5
+                            )
+                        rle_list.extend(robust_rle_encode(interp.squeeze(1)))
+                        del interp
+                    out_masks[i] = rle_list
                 else:
-                    out_masks[i] = interpolated
-                    if self.to_cpu:
-                        out_masks[i] = out_masks[i].cpu()
+                    interp_chunks = []
+                    for chunk in chunks:
+                        try:
+                            interp = (
+                                interpolate(
+                                    chunk.unsqueeze(1),
+                                    (h, w),
+                                    mode="bilinear",
+                                    align_corners=False,
+                                ).sigmoid()
+                                > 0.5
+                            )
+                        except Exception:
+                            logging.info("Issue found, reverting to CPU mode!")
+                            interp = (
+                                interpolate(
+                                    chunk.cpu().unsqueeze(1),
+                                    (h, w),
+                                    mode="bilinear",
+                                    align_corners=False,
+                                ).sigmoid()
+                                > 0.5
+                            )
+                        if self.to_cpu:
+                            interp = interp.cpu()
+                        interp_chunks.append(interp)
+                        del chunk
+                    out_masks[i] = torch.cat(interp_chunks, dim=0)
+                    del interp_chunks
 
         return out_masks
 
@@ -267,11 +310,11 @@ class PostProcessImage(nn.Module):
                 if self.use_original_sizes_box
                 else torch.ones_like(meta.original_size)
             )
-            img_size_for_masks = (
-                meta.original_size
-                if self.use_original_sizes_mask
-                else torch.ones_like(meta.original_size)
-            )
+            if self.use_original_sizes_mask:
+                img_size_for_masks = meta.original_size
+            else:
+                res = self.eval_resolution or 1008
+                img_size_for_masks = torch.full_like(meta.original_size, res)
             detection_results = self(
                 outputs,
                 img_size_for_boxes,

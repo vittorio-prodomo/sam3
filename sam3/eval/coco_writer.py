@@ -236,6 +236,11 @@ class PredictionDumper:
         """Reset internal state for a new evaluation round."""
         self.dump = []
 
+    @staticmethod
+    def is_better(new_value, old_value):
+        """Higher is better for all COCO metrics (AP, AR)."""
+        return new_value > old_value
+
     def prepare(self, predictions, iou_type):
         """
         Route predictions to the appropriate preparation method based on iou_type.

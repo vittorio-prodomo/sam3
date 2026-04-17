@@ -12,6 +12,7 @@ we may need to split the inference process for a given image in several chunks.
 
 import logging
 from collections import defaultdict
+from typing import Optional
 
 import torch
 from pycocotools.coco import COCO
@@ -24,7 +25,7 @@ try:
     HAS_TIDE = True
 except ImportError:
     HAS_TIDE = False
-    print("WARNING: TIDE not installed. Detailed analysis will not be available.")
+    logging.debug("TIDE not installed. Install via `pip install tidecv` for detailed error analysis.")
 
 
 # the COCO detection metrics (https://github.com/cocodataset/cocoapi/blob/8c9bcc3cf640524c4c20a9c40e89cb6a2f2fa0e9/PythonAPI/pycocotools/cocoeval.py#L460-L471)
@@ -50,6 +51,25 @@ def convert_to_xywh(boxes):
     return torch.stack((xmin, ymin, xmax - xmin, ymax - ymin), dim=-1)
 
 
+def _resize_masks(anns, target_resolution):
+    """Resize RLE-encoded masks to a fixed square resolution."""
+    import pycocotools.mask as mask_utils
+    import numpy as np
+
+    target_h = target_w = target_resolution
+    for ann in anns:
+        rle = ann["segmentation"]
+        h, w = rle["size"]
+        if h == target_h and w == target_w:
+            continue
+        mask = mask_utils.decode(rle)
+        row_idx = np.linspace(0, h - 1, target_h, dtype=int)
+        col_idx = np.linspace(0, w - 1, target_w, dtype=int)
+        mask_resized = mask[np.ix_(row_idx, col_idx)]
+        ann["segmentation"] = mask_utils.encode(np.asfortranarray(mask_resized))
+        ann["area"] = int(mask_resized.sum())
+
+
 class HeapElement:
     """Utility class to make a heap with a custom comparator"""
 
@@ -66,10 +86,12 @@ class COCOevalCustom(COCOeval):
     """
 
     def __init__(
-        self, cocoGt=None, cocoDt=None, iouType="segm", dt_only_positive=False
+        self, cocoGt=None, cocoDt=None, iouType="segm", dt_only_positive=False,
+        eval_resolution=None,
     ):
         super().__init__(cocoGt, cocoDt, iouType)
         self.dt_only_positive = dt_only_positive
+        self.eval_resolution = eval_resolution
 
     def _prepare(self):
         """
@@ -99,6 +121,8 @@ class COCOevalCustom(COCOeval):
         if p.iouType == "segm":
             _toMask(gts, self.cocoGt)
             _toMask(dts, self.cocoDt)
+            if self.eval_resolution is not None:
+                _resize_masks(gts, self.eval_resolution)
         # set ignore flag
         for gt in gts:
             gt["ignore"] = gt["ignore"] if "ignore" in gt else 0
@@ -133,11 +157,13 @@ class CocoEvaluatorOfflineWithPredFileEvaluators:
         tide: bool = True,
         iou_type: str = "bbox",
         positive_split=False,
+        eval_resolution: Optional[int] = None,
     ):
         self.gt_path = gt_path
         self.tide_enabled = HAS_TIDE and tide
         self.positive_split = positive_split
         self.iou_type = iou_type
+        self.eval_resolution = eval_resolution
 
     def evaluate(self, dumped_file):
         if not is_main_process():
@@ -153,7 +179,8 @@ class CocoEvaluatorOfflineWithPredFileEvaluators:
         # Run the evaluation
         logging.info("Coco evaluator: Running evaluation")
         coco_eval = COCOevalCustom(
-            self.gt, cocoDt, iouType=self.iou_type, dt_only_positive=self.positive_split
+            self.gt, cocoDt, iouType=self.iou_type, dt_only_positive=self.positive_split,
+            eval_resolution=self.eval_resolution,
         )
         coco_eval.evaluate()
         coco_eval.accumulate()
