@@ -7,6 +7,7 @@ import math
 import os
 import random
 import re
+import sys
 from datetime import timedelta
 from typing import Optional
 
@@ -149,8 +150,8 @@ def log_env_variables():
     for k in env_keys:
         v = os.environ[k]
         st += f"{k}={v}\n"
-    logging.info("Logging ENV_VARIABLES")
-    logging.info(st)
+    logging.debug("Logging ENV_VARIABLES")
+    logging.debug(st)
 
 
 class AverageMeter:
@@ -274,6 +275,119 @@ class ProgressMeter:
         num_digits = len(str(num_batches // 1))
         fmt = "{:" + str(num_digits) + "d}"
         return "[" + fmt + "/" + fmt.format(num_batches) + "]"
+
+
+class RichProgressMeter:
+    """Progress reporter using Rich. Interface-compatible with ProgressMeter
+    (same constructor, same display() method) but renders a single updating
+    progress bar instead of spamming log lines. On non-rank-0 it's a no-op.
+    """
+
+    _handler_installed = False
+    _shared_console = None
+
+    def __init__(self, num_batches, meters, real_meters, prefix=""):
+        self.num_batches = num_batches
+        self.meters = meters
+        self.real_meters = real_meters
+        self.prefix = prefix
+        self._progress = None
+        self._task_id = None
+        _, self._rank = get_machine_local_and_dist_rank()
+
+    @classmethod
+    def _install_rich_logging(cls):
+        """Route root-logger StreamHandlers through a shared Rich console so
+        log messages coexist cleanly with the live progress bar."""
+        if cls._handler_installed:
+            return
+        from rich.console import Console
+        from rich.logging import RichHandler
+
+        cls._shared_console = Console()
+        rich_handler = RichHandler(
+            console=cls._shared_console,
+            show_path=False,
+            rich_tracebacks=False,
+            show_time=True,
+            markup=False,
+        )
+        rich_handler.setLevel(logging.INFO)
+        # Use the same formatter as the original console handler so output is consistent
+        rich_handler.setFormatter(logging.Formatter("%(message)s"))
+        root = logging.root
+        for h in list(root.handlers):
+            # Replace plain StreamHandlers writing to stdout/stderr. Keep file handlers.
+            if (
+                isinstance(h, logging.StreamHandler)
+                and not isinstance(h, RichHandler)
+                and getattr(h, "stream", None) in (sys.stdout, sys.stderr)
+            ):
+                root.removeHandler(h)
+        root.addHandler(rich_handler)
+        cls._handler_installed = True
+
+    def _ensure_started(self):
+        if self._progress is not None or self._rank != 0:
+            return
+        from rich.progress import (
+            BarColumn,
+            MofNCompleteColumn,
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
+            TimeRemainingColumn,
+        )
+
+        RichProgressMeter._install_rich_logging()
+        self._progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=None),
+            MofNCompleteColumn(),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("•"),
+            TimeRemainingColumn(),
+            TextColumn("• {task.fields[postfix]}"),
+            console=RichProgressMeter._shared_console,
+            transient=False,
+            refresh_per_second=4,
+        )
+        self._progress.start()
+        self._task_id = self._progress.add_task(
+            self.prefix, total=self.num_batches, postfix=""
+        )
+
+    def display(self, batch, enable_print=False):
+        if self._rank != 0:
+            return
+        self._ensure_started()
+        # Build a compact postfix with a few key meter values (loss + time)
+        parts = []
+        for m in self.meters:
+            if not hasattr(m, "val"):
+                continue
+            name = m.name.split(" ")[0].lower()
+            # Compact formatting: scientific for losses, 2 decimals otherwise
+            if "loss" in name:
+                val_str = f"{m.val:.2e}"
+            elif isinstance(m.val, float):
+                val_str = f"{m.val:.2f}"
+            else:
+                val_str = str(m.val)
+            parts.append(f"{name}={val_str}")
+        postfix = " ".join(parts[:4])  # keep the bar one line
+        self._progress.update(self._task_id, completed=batch + 1, postfix=postfix)
+
+    def close(self):
+        if self._progress is not None:
+            # Complete the bar so the final line stays visible
+            if self._task_id is not None:
+                self._progress.update(self._task_id, completed=self.num_batches)
+            self._progress.stop()
+            self._progress = None
 
 
 def get_resume_checkpoint(checkpoint_save_dir):

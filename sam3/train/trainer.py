@@ -45,7 +45,7 @@ from sam3.train.utils.train_utils import (
     makedir,
     MemMeter,
     Phase,
-    ProgressMeter,
+    RichProgressMeter,
     set_seeds,
     setup_distributed_backend,
 )
@@ -136,6 +136,14 @@ class LoggingConf:
     scalar_keys_to_log: Optional[Dict[str, Any]] = None
     log_batch_stats: bool = False
     wandb_writer: Optional[Any] = None
+    mlflow_writer: Optional[Any] = None
+
+
+@dataclass
+class EarlyStoppingConf:
+    patience: int = 10
+    monitor: str = "coco_eval_segm_AP"
+    mode: str = "max"
 
 
 class Trainer:
@@ -168,6 +176,7 @@ class Trainer:
         skip_saving_ckpts: bool = False,
         empty_gpu_mem_cache_after_eval: bool = True,
         gradient_accumulation_steps: int = 1,
+        early_stopping: Optional[Dict[str, Any]] = None,
     ):
         self._setup_env_variables(env_variables)
         self._setup_timers()
@@ -183,6 +192,9 @@ class Trainer:
         self.meters_conf = meters
         self.loss_conf = loss
         self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.early_stopping_conf = EarlyStoppingConf(**early_stopping) if early_stopping else None
+        self._es_best_value = None
+        self._es_epochs_without_improvement = 0
         distributed = DistributedConf(**distributed or {})
         cuda = CudaConf(**cuda or {})
         self.where = 0.0
@@ -363,6 +375,8 @@ class Trainer:
             "steps": self.steps,
             "time_elapsed": self.time_elapsed_meter.val,
             "best_meter_values": self.best_meter_values,
+            "es_best_value": self._es_best_value,
+            "es_epochs_without_improvement": self._es_epochs_without_improvement,
         }
         if self.optim_conf.amp.enabled:
             checkpoint["scaler"] = self.scaler.state_dict()
@@ -455,6 +469,9 @@ class Trainer:
 
         self.best_meter_values = checkpoint.get("best_meter_values", {})
 
+        self._es_best_value = checkpoint.get("es_best_value", None)
+        self._es_epochs_without_improvement = checkpoint.get("es_epochs_without_improvement", 0)
+
         if "train_dataset" in checkpoint and self.train_dataset is not None:
             self.train_dataset.load_checkpoint_state(checkpoint["train_dataset"])
 
@@ -465,6 +482,44 @@ class Trainer:
             and epoch < self.max_epochs - 1
             and not skip_epoch
         )
+
+    def _check_early_stopping(self, val_out_dict: dict) -> bool:
+        """Check if training should stop. Returns True if we should stop."""
+        if self.early_stopping_conf is None:
+            return False
+
+        monitor = self.early_stopping_conf.monitor
+        value = None
+        for k, v in val_out_dict.items():
+            if monitor in k:
+                value = v
+                break
+
+        if value is None:
+            logging.warning(f"Early stopping: metric '{monitor}' not found in val output. Skipping check.")
+            return False
+
+        improved = (
+            (value > self._es_best_value + self.EPSILON)
+            if self.early_stopping_conf.mode == "max"
+            else (value < self._es_best_value - self.EPSILON)
+        ) if self._es_best_value is not None else True
+
+        if improved:
+            self._es_best_value = value
+            self._es_epochs_without_improvement = 0
+            logging.info(f"Early stopping: metric '{monitor}' improved to {value:.6f}")
+        else:
+            self._es_epochs_without_improvement += 1
+            logging.info(
+                f"Early stopping: no improvement for {self._es_epochs_without_improvement}/{self.early_stopping_conf.patience} "
+                f"val epochs (best={self._es_best_value:.6f}, current={value:.6f})"
+            )
+
+        if self._es_epochs_without_improvement >= self.early_stopping_conf.patience:
+            logging.info(f"Early stopping triggered after {self.early_stopping_conf.patience} val epochs without improvement.")
+            return True
+        return False
 
     def _find_loss(self, key: str):
         if key in self.loss:
@@ -561,11 +616,59 @@ class Trainer:
                     self.run_val()
                     self.epoch += 1
             self.run_train()
-            self.run_val()
+            self._final_full_res_validation()
         elif self.mode == "val":
             self.run_val()
         elif self.mode == "train_only":
             self.run_train()
+
+    def _final_full_res_validation(self):
+        """Load best checkpoint (if available), switch to full-res masks, run final validation."""
+        best_ckpt = self._find_best_checkpoint()
+        if best_ckpt:
+            logging.info(f"Final eval: loading best checkpoint from {best_ckpt}")
+            with g_pathmgr.open(best_ckpt, "rb") as f:
+                checkpoint = torch.load(f, map_location="cpu")
+            load_state_dict_into_model(
+                model=self.model,
+                state_dict=checkpoint["model"],
+                ignore_missing_keys=self.checkpoint_conf.skip_saving_parameters,
+            )
+            self.epoch = checkpoint["epoch"] - 1  # checkpoint saves epoch+1
+            del checkpoint
+        else:
+            logging.info("Final eval: no best checkpoint found, using last weights")
+
+        self._set_postprocessor_full_res(True)
+        logging.info("Final eval: running full-resolution validation")
+        self.run_val()
+        self._set_postprocessor_full_res(False)
+
+    def _find_best_checkpoint(self):
+        """Find the best checkpoint saved by save_best_meters."""
+        ckpt_dir = self.checkpoint_conf.save_dir
+        if not g_pathmgr.exists(ckpt_dir):
+            return None
+        try:
+            for f in g_pathmgr.ls(ckpt_dir):
+                name = os.path.basename(f)
+                if name.startswith("checkpoint_") and name.endswith(".pt"):
+                    suffix = name[len("checkpoint_"):-len(".pt")]
+                    if not suffix.isdigit():
+                        return os.path.join(ckpt_dir, name)
+        except Exception:
+            pass
+        return None
+
+    def _set_postprocessor_full_res(self, enabled: bool):
+        """Toggle use_original_sizes_mask on all postprocessors in meters."""
+        for phase_meters in self.meters.values():
+            for key_meters in phase_meters.values():
+                for meter in key_meters.values():
+                    pp = getattr(meter, "postprocessor", None)
+                    if pp and hasattr(pp, "use_original_sizes_mask"):
+                        pp.use_original_sizes_mask = enabled
+                        logging.info(f"Set postprocessor use_original_sizes_mask={enabled}")
 
     def _setup_dataloaders(self):
         self.train_dataset = None
@@ -601,11 +704,13 @@ class Trainer:
             # Run val, not running on last epoch since will run after the
             # loop anyway
             if self.is_intermediate_val_epoch(self.epoch):
-                self.run_val()
+                val_outs = self.run_val()
                 if torch.cuda.is_available() and self.empty_gpu_mem_cache_after_eval:
                     # release memory buffers held by the model during eval (which typically
                     # involves a lot more frames in video grounding that during training)
                     torch.cuda.empty_cache()
+                if val_outs and self._check_early_stopping(val_outs):
+                    break
 
             if self.distributed_rank == 0:
                 self.best_meter_values.update(self._get_trainer_state("train"))
@@ -621,7 +726,7 @@ class Trainer:
 
     def run_val(self):
         if not self.val_dataset:
-            return
+            return None
 
         dataloader = self.val_dataset.get_loader(epoch=int(self.epoch))
         outs = self.val_epoch(dataloader, phase=Phase.VAL)
@@ -635,6 +740,8 @@ class Trainer:
                 "a",
             ) as f:
                 f.write(json.dumps(outs) + "\n")
+
+        return outs
 
     def val_epoch(self, val_loader, phase):
         batch_time = AverageMeter("Batch Time", self.device, ":.2f")
@@ -661,7 +768,7 @@ class Trainer:
             if hasattr(unwrap_ddp_if_wrapped(model), "on_validation_epoch_start"):
                 unwrap_ddp_if_wrapped(model).on_validation_epoch_start()
 
-        progress = ProgressMeter(
+        progress = RichProgressMeter(
             iters_per_epoch,
             [batch_time, data_time, mem, self.time_elapsed_meter, *loss_mts.values()],
             self._get_meters(curr_phases),
@@ -731,6 +838,7 @@ class Trainer:
             if data_iter % 10 == 0:
                 dist.barrier()
 
+        progress.close()
         self.est_epoch_time[phase] = batch_time.avg * iters_per_epoch
         self._log_timers(phase)
         for model in curr_models:
@@ -776,7 +884,7 @@ class Trainer:
         )
         extra_loss_mts = {}
 
-        progress = ProgressMeter(
+        progress = RichProgressMeter(
             iters_per_epoch,
             [
                 batch_time_meter,
@@ -872,6 +980,7 @@ class Trainer:
             except FloatingPointError as e:
                 raise e
 
+        progress.close()
         self.est_epoch_time[Phase.TRAIN] = batch_time_meter.avg * iters_per_epoch
         self._log_timers(Phase.TRAIN)
         self._log_sync_data_times(Phase.TRAIN, data_times)
@@ -1134,7 +1243,7 @@ def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
     non_trainable_parameters = total_parameters - trainable_parameters
     logging.info("==" * 10)
     logging.info(f"Summary for model {type(model)}")
-    logging.info(f"Model is {model}")
+    logging.debug(f"Model is {model}")
     logging.info(f"\tTotal parameters {get_human_readable_count(total_parameters)}")
     logging.info(
         f"\tTrainable parameters {get_human_readable_count(trainable_parameters)}"

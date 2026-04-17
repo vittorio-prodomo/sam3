@@ -27,6 +27,24 @@ def make_tensorboard_logger(log_dir: str, **writer_kwargs: Any):
     )
 
 
+def make_wandb_logger(project: str, name: Optional[str] = None, **kwargs: Any):
+    return WandbLogger(project=project, name=name, **kwargs)
+
+
+def make_mlflow_logger(
+    experiment_name: str,
+    run_name: Optional[str] = None,
+    tracking_uri: Optional[str] = None,
+    **kwargs: Any,
+):
+    return MlflowLogger(
+        experiment_name=experiment_name,
+        run_name=run_name,
+        tracking_uri=tracking_uri,
+        **kwargs,
+    )
+
+
 class TensorBoardWriterWrapper:
     """
     A wrapper around a SummaryWriter object.
@@ -144,30 +162,173 @@ class TensorBoardLogger(TensorBoardWriterWrapper):
         self._writer.add_hparams(hparams, meters)
 
 
-class Logger:
+class WandbLogger:
     """
-    A logger class that can interface with multiple loggers. It now supports tensorboard only for simplicity, but you can extend it with your own logger.
+    A logger for Weights & Biases. Only initializes on rank 0.
     """
 
-    def __init__(self, logging_conf):
-        # allow turning off TensorBoard with "should_log: false" in config
-        tb_config = logging_conf.tensorboard_writer
-        tb_should_log = tb_config and tb_config.pop("should_log", True)
-        self.tb_logger = instantiate(tb_config) if tb_should_log else None
+    def __init__(
+        self, project: str, name: Optional[str] = None, config: Optional[Dict] = None, **kwargs: Any
+    ) -> None:
+        self._run = None
+        _, self._rank = get_machine_local_and_dist_rank()
+        if self._rank == 0:
+            import wandb
+
+            self._run = wandb.init(
+                project=project, name=name, config=config, **kwargs
+            )
+            # SAM 3 logs at two different step axes: per-batch (via `log()`) and
+            # per-epoch (via `log_dict()`). W&B's default global monotonic step
+            # drops epoch-level metrics because their step is smaller than the
+            # latest batch step. Decouple them via `define_metric`.
+            wandb.define_metric("train/step")
+            wandb.define_metric("train/epoch")
+            wandb.define_metric("Step_Stats/*", step_metric="train/step")
+            wandb.define_metric("*", step_metric="train/epoch")
+            logging.info(
+                f"W&B run initialized: {self._run.url}"
+            )
+        atexit.register(self.close)
 
     def log_dict(self, payload: Dict[str, Scalar], step: int) -> None:
-        if self.tb_logger:
-            self.tb_logger.log_dict(payload, step)
+        if not self._run:
+            return
+        # log_dict is called per-epoch in SAM 3's trainer
+        self._run.log({**payload, "train/epoch": step})
 
     def log(self, name: str, data: Scalar, step: int) -> None:
-        if self.tb_logger:
-            self.tb_logger.log(name, data, step)
+        if not self._run:
+            return
+        # log is called per-batch in SAM 3's trainer
+        self._run.log({name: data, "train/step": step})
 
     def log_hparams(
         self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]
     ) -> None:
-        if self.tb_logger:
-            self.tb_logger.log_hparams(hparams, meters)
+        if not self._run:
+            return
+        self._run.config.update(hparams, allow_val_change=True)
+        for k, v in meters.items():
+            self._run.summary[k] = v
+
+    def close(self) -> None:
+        if not self._run:
+            return
+        import wandb
+
+        wandb.finish()
+        self._run = None
+
+
+class MlflowLogger:
+    """
+    A logger for MLflow. Only initializes on rank 0.
+    MLflow does not support "/" in metric names, so they are replaced with ".".
+    """
+
+    def __init__(
+        self,
+        experiment_name: str,
+        run_name: Optional[str] = None,
+        tracking_uri: Optional[str] = None,
+        **kwargs: Any,
+    ) -> None:
+        self._run = None
+        _, self._rank = get_machine_local_and_dist_rank()
+        if self._rank == 0:
+            import mlflow
+
+            if tracking_uri:
+                mlflow.set_tracking_uri(tracking_uri)
+            mlflow.set_experiment(experiment_name)
+            self._run = mlflow.start_run(run_name=run_name, **kwargs)
+            logging.info(
+                f"MLflow run initialized: {self._run.info.run_id}"
+            )
+        atexit.register(self.close)
+
+    @staticmethod
+    def _sanitize_key(name: str) -> str:
+        return name.replace("/", ".")
+
+    def log_dict(self, payload: Dict[str, Scalar], step: int) -> None:
+        if not self._run:
+            return
+        import mlflow
+
+        mlflow.log_metrics(
+            {self._sanitize_key(k): float(v) for k, v in payload.items()},
+            step=step,
+        )
+
+    def log(self, name: str, data: Scalar, step: int) -> None:
+        if not self._run:
+            return
+        import mlflow
+
+        mlflow.log_metric(self._sanitize_key(name), float(data), step=step)
+
+    def log_hparams(
+        self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]
+    ) -> None:
+        if not self._run:
+            return
+        import mlflow
+
+        mlflow.log_params(
+            {self._sanitize_key(k): v for k, v in hparams.items()}
+        )
+        mlflow.log_metrics(
+            {self._sanitize_key(k): float(v) for k, v in meters.items()}
+        )
+
+    def close(self) -> None:
+        if not self._run:
+            return
+        import mlflow
+
+        mlflow.end_run()
+        self._run = None
+
+
+class Logger:
+    """
+    A logger class that fans out to multiple backends: TensorBoard, W&B, MLflow.
+    Each backend is optional and controlled by the corresponding field in logging_conf.
+    """
+
+    def __init__(self, logging_conf):
+        # TensorBoard (always present in config)
+        tb_config = logging_conf.tensorboard_writer
+        tb_should_log = tb_config and tb_config.pop("should_log", True)
+        self.tb_logger = instantiate(tb_config) if tb_should_log else None
+
+        # W&B (may not exist on older configs)
+        wandb_config = getattr(logging_conf, "wandb_writer", None)
+        wandb_should_log = wandb_config and wandb_config.pop("should_log", True)
+        self.wandb_logger = instantiate(wandb_config) if wandb_should_log else None
+
+        # MLflow (may not exist on older configs)
+        mlflow_config = getattr(logging_conf, "mlflow_writer", None)
+        mlflow_should_log = mlflow_config and mlflow_config.pop("should_log", True)
+        self.mlflow_logger = instantiate(mlflow_config) if mlflow_should_log else None
+
+    def _for_each(self, method: str, *args: Any, **kwargs: Any) -> None:
+        for logger in (self.tb_logger, self.wandb_logger, self.mlflow_logger):
+            if logger is not None:
+                getattr(logger, method)(*args, **kwargs)
+
+    def log_dict(self, payload: Dict[str, Scalar], step: int) -> None:
+        self._for_each("log_dict", payload, step)
+
+    def log(self, name: str, data: Scalar, step: int) -> None:
+        self._for_each("log", name, data, step)
+
+    def log_hparams(
+        self, hparams: Dict[str, Scalar], meters: Dict[str, Scalar]
+    ) -> None:
+        self._for_each("log_hparams", hparams, meters)
 
 
 # cache the opened file object, so that different calls to `setup_logger`

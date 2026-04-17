@@ -153,5 +153,5 @@ Thumbs.db
 *.vocab
 
 # Runtime artifacts from Hydra config resolution and W&B local cache
-configs/
-wandb/
+/configs/
+/wandb/
