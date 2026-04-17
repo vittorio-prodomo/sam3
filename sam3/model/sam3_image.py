@@ -11,7 +11,7 @@ import torch
 from sam3.model.model_misc import SAM3Output
 from sam3.model.sam1_task_predictor import SAM3InteractiveImagePredictor
 from sam3.model.vl_combiner import SAM3VLBackbone
-from sam3.perflib.nms import nms_masks
+from sam3.model.sam3_multiplex_detector_utils import nms_masks
 from sam3.train.data.collator import BatchedDatapoint
 
 from .act_ckpt_utils import activation_ckpt_wrapper
@@ -56,9 +56,18 @@ class Sam3Image(torch.nn.Module):
         separate_scorer_for_instance: bool = False,
         num_interactive_steps_val: int = 0,
         inst_interactive_predictor: SAM3InteractiveImagePredictor = None,
+        # NMS post-processing (eval only)
+        run_nms: bool = False,
+        nms_prob_thresh: float = 0.001,
+        nms_iou_thresh: float = 0.8,
+        nms_use_iom: bool = True,
         **kwargs,
     ):
         super().__init__()
+        self.run_nms = run_nms
+        self.nms_prob_thresh = nms_prob_thresh
+        self.nms_iou_thresh = nms_iou_thresh
+        self.nms_use_iom = nms_use_iom
         self.backbone = backbone
         self.geometry_encoder = input_geometry_encoder
         self.transformer = transformer
@@ -595,6 +604,19 @@ class Sam3Image(torch.nn.Module):
                 find_target=find_target,
                 geometric_prompt=geometric_prompt.clone(),
             )
+            # NMS to suppress overlapping masks (eval only)
+            if self.run_nms and not self.training and "pred_masks" in out:
+                pred_probs = out["pred_logits"].squeeze(-1).sigmoid()
+                pred_masks = out["pred_masks"]
+                for prompt_idx in range(pred_probs.size(0)):
+                    keep = nms_masks(
+                        pred_probs=pred_probs[prompt_idx],
+                        pred_masks=pred_masks[prompt_idx],
+                        prob_threshold=self.nms_prob_thresh,
+                        iou_threshold=self.nms_iou_thresh,
+                        nms_use_iom=self.nms_use_iom,
+                    )
+                    out["pred_logits"][prompt_idx, :, 0] -= 1e4 * (~keep).float()
             stage_outs.append(out)
 
         previous_stages_out.append(stage_outs)

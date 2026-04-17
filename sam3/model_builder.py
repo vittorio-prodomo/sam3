@@ -307,6 +307,10 @@ def _create_sam3_model(
     dot_prod_scoring,
     inst_interactive_predictor,
     eval_mode,
+    run_nms=False,
+    nms_prob_thresh=0.001,
+    nms_iou_thresh=0.8,
+    nms_use_iom=True,
 ):
     """Create the SAM3 image model."""
     common_params = {
@@ -320,6 +324,10 @@ def _create_sam3_model(
         "use_instance_query": False,
         "multimask_output": True,
         "inst_interactive_predictor": inst_interactive_predictor,
+        "run_nms": run_nms,
+        "nms_prob_thresh": nms_prob_thresh,
+        "nms_iou_thresh": nms_iou_thresh,
+        "nms_use_iom": nms_use_iom,
     }
 
     matcher = None
@@ -579,6 +587,11 @@ def build_sam3_image_model(
     enable_segmentation=True,
     enable_inst_interactivity=False,
     compile=False,
+    # NMS post-processing (eval only)
+    run_nms=False,
+    nms_prob_thresh=0.001,
+    nms_iou_thresh=0.8,
+    nms_use_iom=True,
 ):
     """
     Build SAM3 image model
@@ -641,6 +654,10 @@ def build_sam3_image_model(
         dot_prod_scoring,
         inst_predictor,
         eval_mode,
+        run_nms=run_nms,
+        nms_prob_thresh=nms_prob_thresh,
+        nms_iou_thresh=nms_iou_thresh,
+        nms_use_iom=nms_use_iom,
     )
     if load_from_HF and checkpoint_path is None:
         checkpoint_path = download_ckpt_from_hf(version="sam3")
