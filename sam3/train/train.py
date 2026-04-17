@@ -143,9 +143,7 @@ def main(args) -> None:
         cfg.launcher.experiment_log_dir = os.path.join(
             os.getcwd(), "sam3_logs", args.config
         )
-    print("###################### Train App Config ####################")
-    print(OmegaConf.to_yaml(cfg))
-    print("############################################################")
+    # Full config saved to experiment_log_dir/config.yaml — skip console dump
 
     add_pythonpath_to_sys_path()
     makedir(cfg.launcher.experiment_log_dir)
