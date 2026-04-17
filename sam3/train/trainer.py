@@ -873,6 +873,15 @@ class Trainer:
         data_times = []
         phase = Phase.TRAIN
 
+        # NOTE: iters_per_epoch is len(train_loader) — i.e. dataset size /
+        # batch_size. This means one `trainer.max_epochs` == one full pass
+        # over the dataset (a "data epoch" in Ultralytics/Lightning parlance).
+        # Upstream `scratch.target_epoch_size` / `scratch.max_data_epochs`
+        # scratch vars suggest a different scheme where trainer epochs
+        # sample a fixed number of batches with replacement, but those vars
+        # are NOT wired up in this code path — len(train_loader) is used
+        # directly. Keep this in mind when setting `max_epochs` and
+        # `early_stopping.patience` in configs: both are in data-epoch units.
         iters_per_epoch = len(train_loader)
 
         loss_names = []

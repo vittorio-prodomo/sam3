@@ -156,8 +156,15 @@ scratch:
 
   num_train_workers: 8
   num_val_workers: 0
-  max_data_epochs: 200
-  target_epoch_size: 1500
+  # NOTE: Upstream SAM 3 configs declare `max_data_epochs` and
+  # `target_epoch_size` under `scratch`, but they are NEVER referenced by
+  # the Python trainer or by any other YAML interpolation in the bridge-
+  # defect configs. The trainer computes iters_per_epoch from
+  # len(train_loader) directly (see trainer.py ~line 876), so one
+  # `trainer.max_epochs` == one full pass over the dataset. For our small
+  # fine-tuning datasets (e.g. 230 images), `max_epochs: 30` means 30
+  # data epochs, and `early_stopping.patience: 5` means 5 data epochs
+  # without AP improvement. Removed the dead params to avoid confusion.
   hybrid_repeats: 1
   context_length: 2
   gather_pred_via_filesys: false

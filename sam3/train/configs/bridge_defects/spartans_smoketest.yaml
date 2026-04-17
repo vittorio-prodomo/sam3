@@ -156,8 +156,10 @@ scratch:
 
   num_train_workers: 4
   num_val_workers: 0
-  max_data_epochs: 2
-  target_epoch_size: 20
+  # NOTE: Upstream declares `max_data_epochs` / `target_epoch_size` here,
+  # but they are dead params — never referenced by the Python trainer or
+  # any YAML interpolation. The trainer uses len(train_loader) directly,
+  # so `trainer.max_epochs` is already in data-epoch units. Removed.
   hybrid_repeats: 1
   context_length: 2
   gather_pred_via_filesys: false
