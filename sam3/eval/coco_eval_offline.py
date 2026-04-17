@@ -70,6 +70,73 @@ def _resize_masks(anns, target_resolution):
         ann["area"] = int(mask_resized.sum())
 
 
+def _build_downscaled_gt_json(gt_path: str, eval_resolution: int, out_path: str) -> str:
+    """Read a COCO GT JSON, downscale all annotation masks to (eval_resolution x
+    eval_resolution), and write a new JSON to out_path. Handles both polygon
+    and RLE segmentations. Needed for TIDE because it loads the GT file
+    directly and has no hook for in-memory mask resizing (unlike pycocotools
+    where _prepare() intercepts the annotations first).
+    """
+    import json
+    import numpy as np
+    import pycocotools.mask as mask_utils
+
+    target_h = target_w = eval_resolution
+    with open(gt_path, "r") as f:
+        data = json.load(f)
+
+    id_to_img = {img["id"]: img for img in data.get("images", [])}
+
+    for ann in data.get("annotations", []):
+        img = id_to_img.get(ann["image_id"])
+        if img is None:
+            continue
+        src_h, src_w = img["height"], img["width"]
+        seg = ann.get("segmentation")
+        if seg is None:
+            continue
+        # Decode any supported format to a binary mask at source resolution.
+        if isinstance(seg, list):
+            # polygon list
+            rles = mask_utils.frPyObjects(seg, src_h, src_w)
+            rle = mask_utils.merge(rles) if len(rles) > 1 else rles[0]
+            mask = mask_utils.decode(rle)
+        elif isinstance(seg, dict):
+            if isinstance(seg.get("counts"), list):
+                # uncompressed RLE
+                rle = mask_utils.frPyObjects(seg, src_h, src_w)
+            else:
+                rle = seg
+            mask = mask_utils.decode(rle)
+        else:
+            continue
+        # Nearest-neighbor downscale via index mapping.
+        row_idx = np.linspace(0, src_h - 1, target_h, dtype=int)
+        col_idx = np.linspace(0, src_w - 1, target_w, dtype=int)
+        mask_resized = mask[np.ix_(row_idx, col_idx)]
+        rle_resized = mask_utils.encode(np.asfortranarray(mask_resized))
+        # `counts` is bytes after encode — make JSON-serializable.
+        if isinstance(rle_resized.get("counts"), (bytes, bytearray)):
+            rle_resized["counts"] = rle_resized["counts"].decode("ascii")
+        ann["segmentation"] = rle_resized
+        ann["area"] = int(mask_resized.sum())
+        # Box coords also need to be scaled so TIDE's area categories stay sane.
+        if "bbox" in ann and ann["bbox"] is not None:
+            x, y, w, h = ann["bbox"]
+            sx = target_w / src_w
+            sy = target_h / src_h
+            ann["bbox"] = [x * sx, y * sy, w * sx, h * sy]
+
+    # Images must also report the new size so downstream tools pick it up.
+    for img in data.get("images", []):
+        img["height"] = target_h
+        img["width"] = target_w
+
+    with open(out_path, "w") as f:
+        json.dump(data, f)
+    return out_path
+
+
 class HeapElement:
     """Utility class to make a heap with a custom comparator"""
 
@@ -91,6 +158,11 @@ class COCOevalCustom(COCOeval):
     ):
         super().__init__(cocoGt, cocoDt, iouType)
         self.dt_only_positive = dt_only_positive
+        # eval_resolution is kept for backwards-compat but is no longer the
+        # source of truth. _prepare() now auto-detects the prediction
+        # resolution from the dt RLEs and resizes GT to match, so the same
+        # evaluator works for both low-res training eval and full-res final
+        # eval without config changes.
         self.eval_resolution = eval_resolution
 
     def _prepare(self):
@@ -121,8 +193,19 @@ class COCOevalCustom(COCOeval):
         if p.iouType == "segm":
             _toMask(gts, self.cocoGt)
             _toMask(dts, self.cocoDt)
-            if self.eval_resolution is not None:
-                _resize_masks(gts, self.eval_resolution)
+            # Auto-detect prediction resolution from the first dt RLE and
+            # downscale GT masks to match. Handles both low-res training eval
+            # (pred res == eval_resolution, e.g. 1008) and full-res final eval
+            # (pred res == original image size -> GT already matches, no-op).
+            if dts and gts:
+                seg = dts[0].get("segmentation")
+                if isinstance(seg, dict) and "size" in seg:
+                    pred_h, pred_w = seg["size"]
+                    if pred_h == pred_w:
+                        gt_seg = gts[0].get("segmentation")
+                        gt_size = gt_seg.get("size") if isinstance(gt_seg, dict) else None
+                        if gt_size is None or tuple(gt_size) != (pred_h, pred_w):
+                            _resize_masks(gts, pred_h)
         # set ignore flag
         for gt in gts:
             gt["ignore"] = gt["ignore"] if "ignore" in gt else 0
@@ -164,6 +247,64 @@ class CocoEvaluatorOfflineWithPredFileEvaluators:
         self.positive_split = positive_split
         self.iou_type = iou_type
         self.eval_resolution = eval_resolution
+        # Cache for the downscaled GT built for TIDE. TIDE loads the GT file
+        # directly (no hook for in-memory resizing), so when predictions come
+        # back at reduced resolution we must feed it a pre-resized file or IoUs
+        # will all be 0. _downscaled_gt_path holds the cached resolution (int),
+        # _downscaled_gt_file the on-disk path. Rebuild only if the prediction
+        # resolution changes between calls (e.g. training's 1008 -> final
+        # eval's full res).
+        self._downscaled_gt_path: Optional[int] = None
+        self._downscaled_gt_file: Optional[str] = None
+
+    def _detect_pred_resolution(self, dumped_file) -> Optional[int]:
+        """Inspect the first prediction in dumped_file and return its square
+        mask resolution (h when h == w). Returns None if the file is empty or
+        malformed. Used to decide whether GT needs to be downscaled for TIDE
+        (low-res train-time eval) or used as-is (full-res final eval)."""
+        import json
+
+        try:
+            with open(str(dumped_file), "r") as f:
+                preds = json.load(f)
+        except Exception:
+            return None
+        if not preds:
+            return None
+        seg = preds[0].get("segmentation")
+        if not isinstance(seg, dict):
+            return None
+        size = seg.get("size")
+        if not size or size[0] != size[1]:
+            return None
+        return int(size[0])
+
+    def _get_tide_gt_path(self, dumped_file) -> str:
+        """Return the GT path TIDE should load. Inspects the prediction file
+        to determine the resolution; if predictions are at a reduced resolution
+        (typical for low-res training eval), builds (once) a downscaled GT
+        JSON at that resolution. Otherwise returns the original GT path."""
+        pred_res = self._detect_pred_resolution(dumped_file)
+        if pred_res is None or pred_res <= 0:
+            return self.gt_path
+        # If predictions match original GT resolution, no downscaling needed.
+        # We don't know original dims without loading GT, so just skip when
+        # pred_res is "large" (>2048) — full-res drone images are 3648+.
+        if pred_res > 2048:
+            return self.gt_path
+        if self._downscaled_gt_path != pred_res:
+            import os
+
+            base, ext = os.path.splitext(self.gt_path)
+            out_path = f"{base}.downscaled_{pred_res}{ext}"
+            if not os.path.exists(out_path):
+                logging.info(
+                    f"TIDE: building downscaled GT at {pred_res}x{pred_res} -> {out_path}"
+                )
+                _build_downscaled_gt_json(self.gt_path, pred_res, out_path)
+            self._downscaled_gt_path = pred_res
+            self._downscaled_gt_file = out_path
+        return self._downscaled_gt_file
 
     def evaluate(self, dumped_file):
         if not is_main_process():
@@ -192,7 +333,8 @@ class CocoEvaluatorOfflineWithPredFileEvaluators:
 
         if self.tide_enabled:
             logging.info("Coco evaluator: Loading TIDE")
-            self.tide_gt = datasets.COCO(self.gt_path)
+            tide_gt_path = self._get_tide_gt_path(dumped_file)
+            self.tide_gt = datasets.COCO(tide_gt_path)
             self.tide = TIDE(mode="mask" if self.iou_type == "segm" else "bbox")
 
             # Run TIDE
