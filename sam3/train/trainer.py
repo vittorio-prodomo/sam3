@@ -54,6 +54,19 @@ from sam3.train.utils.train_utils import (
 CORE_LOSS_KEY = "core_loss"
 
 
+def _numpy_safe_globals():
+    """Numpy types that may be pickled inside our own checkpoints (best_meter_values,
+    es_best_value — both come from pycocotools returning np.float64). Returned as an
+    allowlist for torch.serialization.safe_globals, which lets us keep weights_only=True
+    (PyTorch 2.6+ default) without opting into arbitrary-code-execution unpickling."""
+    safe = [np._core.multiarray.scalar, np.dtype]
+    if hasattr(np, "dtypes"):
+        safe.extend(
+            obj for _, obj in vars(np.dtypes).items() if isinstance(obj, type)
+        )
+    return safe
+
+
 def unwrap_ddp_if_wrapped(model):
     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
         return model.module
@@ -450,8 +463,9 @@ class Trainer:
     def _load_resuming_checkpoint(self, ckpt_path: str):
         logging.info(f"Resuming training from {ckpt_path}")
 
-        with g_pathmgr.open(ckpt_path, "rb") as f:
-            checkpoint = torch.load(f, map_location="cpu")
+        with torch.serialization.safe_globals(_numpy_safe_globals()):
+            with g_pathmgr.open(ckpt_path, "rb") as f:
+                checkpoint = torch.load(f, map_location="cpu")
         load_state_dict_into_model(
             model=self.model,
             state_dict=checkpoint["model"],
@@ -627,8 +641,9 @@ class Trainer:
         best_ckpt = self._find_best_checkpoint()
         if best_ckpt:
             logging.info(f"Final eval: loading best checkpoint from {best_ckpt}")
-            with g_pathmgr.open(best_ckpt, "rb") as f:
-                checkpoint = torch.load(f, map_location="cpu")
+            with torch.serialization.safe_globals(_numpy_safe_globals()):
+                with g_pathmgr.open(best_ckpt, "rb") as f:
+                    checkpoint = torch.load(f, map_location="cpu")
             load_state_dict_into_model(
                 model=self.model,
                 state_dict=checkpoint["model"],
@@ -959,10 +974,33 @@ class Trainer:
                         self.model, rank=self.distributed_rank, where=self.where
                     )
 
-                # Optimizer step: the scaler will make sure gradients are not
-                # applied if the gradients are infinite
-                self.scaler.step(self.optim.optimizer)
-                self.scaler.update()
+                # GradScaler's inf-skip only fires under fp16 loss scaling; under
+                # bf16 it is a no-op, so NaN/Inf grads would be applied and poison
+                # the weights. Detect and skip manually.
+                has_nonfinite_grad = torch.tensor(
+                    float(
+                        any(
+                            p.grad is not None
+                            and not torch.isfinite(p.grad).all()
+                            for p in self.model.parameters()
+                        )
+                    ),
+                    device=self.device,
+                )
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(has_nonfinite_grad, op=dist.ReduceOp.MAX)
+                if has_nonfinite_grad.item() > 0:
+                    logging.warning(
+                        f"Non-finite gradient at step {self.steps[phase]}; "
+                        "skipping optimizer step."
+                    )
+                    self.optim.zero_grad(set_to_none=True)
+                    self.scaler.update()
+                else:
+                    # Optimizer step: the scaler will make sure gradients are not
+                    # applied if the gradients are infinite
+                    self.scaler.step(self.optim.optimizer)
+                    self.scaler.update()
 
                 # measure elapsed time
                 batch_time_meter.update(time.time() - end)
