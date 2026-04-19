@@ -220,7 +220,7 @@ trainer:
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
   skip_first_val: True
-  max_epochs: 15  # stain dataset has ~5.6k train tiles -> 1 epoch ~= 2 hours
+  max_epochs: 20  # stain dataset has ~5.6k train tiles -> 1 epoch ~= 2 hours
   accelerator: cuda
   seed_value: 42
   val_epoch_freq: 1  # Fast low-res eval every epoch; full-res only at end
@@ -228,7 +228,7 @@ trainer:
   gradient_accumulation_steps: ${scratch.gradient_accumulation_steps}
 
   early_stopping:
-    patience: 5
+    patience: 7
     monitor: "coco_eval_segm_AP"
     mode: max
 
