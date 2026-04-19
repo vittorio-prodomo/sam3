@@ -398,8 +398,22 @@ class Trainer:
         if self.distributed_rank != 0:
             return
 
-        for checkpoint_path in checkpoint_paths:
-            self._save_checkpoint(checkpoint, checkpoint_path)
+        # `save_best_meters` produces one save per improved sub-metric (AP, AP_50,
+        # ..., TIDE_*). When multiple sub-metrics peak in the same val epoch
+        # (common — they correlate strongly), the naive torch.save loop writes
+        # the identical ~10 GB dict N times. Collapse the redundancy by saving
+        # once and hardlinking the rest: same inode, one on-disk copy, the
+        # retrieve-by-name API is preserved. When a later epoch updates one
+        # name but not the others, removing a hardlink only drops its link
+        # count; the other names keep pointing at the old snapshot, which is
+        # the intended semantic (each name holds the checkpoint from the epoch
+        # where ITS metric last peaked).
+        first_path, *link_paths = checkpoint_paths
+        self._save_checkpoint(checkpoint, first_path)
+        for link_path in link_paths:
+            if g_pathmgr.exists(link_path):
+                g_pathmgr.rm(link_path)
+            os.link(first_path, link_path)
 
     def _save_checkpoint(self, checkpoint, checkpoint_path):
         """
