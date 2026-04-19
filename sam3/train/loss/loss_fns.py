@@ -429,6 +429,11 @@ class IABCEMdetr(LossWithWeights):
             elif "presence_logit_dec" in outputs:
                 presence_logits = outputs["presence_logit_dec"].view_as(keep_loss)
                 bs = presence_logits.shape[0]
+                # triton=False: use the F.binary_cross_entropy_with_logits fallback.
+                # The triton kernel's backward underflows bf16 on saturated-sigmoid
+                # inputs (presence head learns strongly-negative logits on empty-target
+                # tiles during fine-tuning → NaN grads). The pytorch path is stable
+                # via log-sum-exp in BCE-with-logits.
                 presence_loss = sigmoid_focal_loss(
                     presence_logits,
                     keep_loss,
@@ -436,6 +441,7 @@ class IABCEMdetr(LossWithWeights):
                     num_boxes=bs,
                     alpha=self.presence_alpha,
                     gamma=self.presence_gamma,
+                    triton=False,
                 )
                 pred = (presence_logits.sigmoid() > 0.5).float()
                 presence_dec_acc = (pred == keep_loss).float().mean()
