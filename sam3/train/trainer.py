@@ -1149,6 +1149,17 @@ class Trainer:
                 if is_better_check is None:
                     continue
 
+                # PredictionDumper.is_better is "higher is better" (correct for
+                # AP/AR). TIDE errors are "lower is better", so applying the same
+                # rule saves snapshots at the worst-TIDE epoch — verified on the
+                # 2026-04-18 stain run: the TIDE_*.pt files landed at the epoch
+                # where each TIDE error increased, not decreased. Skip TIDE keys
+                # from best-tracking; the values still flow to out_dict above
+                # and reach W&B/MLflow/TB for diagnostics, we just don't create
+                # a per-TIDE best-checkpoint file.
+                if "TIDE_" in meter_subkey:
+                    continue
+
                 tracked_meter_key = os.path.join(key, meter_subkey)
                 if tracked_meter_key not in self.best_meter_values or is_better_check(
                     meter_value,
