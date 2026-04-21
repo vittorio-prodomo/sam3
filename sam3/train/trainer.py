@@ -674,20 +674,39 @@ class Trainer:
         self._set_postprocessor_full_res(False)
 
     def _find_best_checkpoint(self):
-        """Find the best checkpoint saved by save_best_meters."""
+        """Find the best checkpoint saved by save_best_meters.
+
+        save_checkpoint writes files named after the tracked meter key with
+        ``/`` replaced by ``_`` (e.g. ``val_spartans_detection_coco_eval_segm_AP.pt``),
+        not ``checkpoint_<something>.pt``. Prefer the primary AP file; fall
+        back to any best-metric file. Excludes the rolling ``checkpoint.pt``
+        and the epoch snapshots ``checkpoint_<N>.pt``.
+        """
         ckpt_dir = self.checkpoint_conf.save_dir
         if not g_pathmgr.exists(ckpt_dir):
             return None
         try:
-            for f in g_pathmgr.ls(ckpt_dir):
-                name = os.path.basename(f)
-                if name.startswith("checkpoint_") and name.endswith(".pt"):
-                    suffix = name[len("checkpoint_"):-len(".pt")]
-                    if not suffix.isdigit():
-                        return os.path.join(ckpt_dir, name)
+            names = [os.path.basename(f) for f in g_pathmgr.ls(ckpt_dir)]
         except Exception:
-            pass
-        return None
+            return None
+
+        def _is_epoch_snapshot(n):
+            if not (n.startswith("checkpoint_") and n.endswith(".pt")):
+                return False
+            return n[len("checkpoint_"):-len(".pt")].isdigit()
+
+        candidates = [
+            n for n in names
+            if n.endswith(".pt") and n != "checkpoint.pt" and not _is_epoch_snapshot(n)
+        ]
+        if not candidates:
+            return None
+
+        primary = next(
+            (n for n in candidates if n.endswith("_coco_eval_segm_AP.pt")), None
+        )
+        chosen = primary or candidates[0]
+        return os.path.join(ckpt_dir, chosen)
 
     def _set_postprocessor_full_res(self, enabled: bool):
         """Toggle use_original_sizes_mask on all postprocessors in meters."""
